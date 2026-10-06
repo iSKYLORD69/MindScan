@@ -353,15 +353,26 @@ def load_model():
 
 model = load_model()
 
-# ── Groq ───────────────────────────────────────────────────
-@st.cache_resource
-def load_groq():
+
+# ── Groq: resilient client (survives app sleep/wake) ───────
+def get_groq_client():
+    existing = st.session_state.get("groq_client")
+    if existing is not None:
+        return existing
+
     key = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
     if not key:
+        st.session_state.groq_client = None
         return None
-    return Groq(api_key=key)
 
-groq_client = load_groq()
+    try:
+        st.session_state.groq_client = Groq(api_key=key)
+    except Exception as e:
+        print(f"[Groq] client init failed: {e}")
+        st.session_state.groq_client = None
+
+    return st.session_state.groq_client
+
 
 for k, v in {
     "page":                 "analyze",
@@ -380,12 +391,12 @@ for k, v in {
     "nearby_error":         None,
     "_nearby_loc_key":      None,
     "scan_source":          "text",
+    "groq_client":          None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
-# ── Cached OSM wrappers (avoid re-hitting OSM on reruns) ───
 @st.cache_data(ttl=3600, show_spinner=False)
 def geocode_city_cached(name: str):
     return geocode_city(name)
@@ -394,13 +405,11 @@ def geocode_city_cached(name: str):
 @st.cache_data(ttl=120, show_spinner=False)
 def get_nearby_places_cached(lat: float, lng: float, stype: str, radius: int):
     result = get_nearby_places(lat, lng, stype, radius)
-    # Don't cache empty results — likely a transient failure
     if not result:
         get_nearby_places_cached.clear()
     return result
 
 
-# ── System prompt ──────────────────────────────────────────
 def build_system_prompt(mood, ctx):
     cl = f"User's text ('{mood}'): \"{ctx[:200]}\"\n\n" if ctx else ""
     m  = {
@@ -419,32 +428,42 @@ Never diagnose. Always remind professional help exists.
 Crisis numbers: iCall 9152987821 | AASRA 91-22-27546669 | Tele MANAS 14416"""
 
 
-# ── Groq response ──────────────────────────────────────────
 def mello_reply(messages, mood, ctx):
-    if not groq_client:
+    client = get_groq_client()
+    if not client:
         return "I'm having trouble connecting 💙\n\n📞 iCall: 9152987821"
+
     try:
         sys_p = build_system_prompt(mood, ctx)
         msgs  = [{"role": "system", "content": sys_p}]
         for m in messages:
             if m["role"] in ["user", "assistant"]:
                 msgs.append({"role": m["role"], "content": m["content"]})
-        r = groq_client.chat.completions.create(
+
+        r = client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             messages=msgs,
             max_tokens=512,
-            temperature=0.75
+            temperature=0.75,
         )
         return r.choices[0].message.content
+
     except Exception as e:
-        print(f"Mello error: {e}")
+        print(f"[Groq] error: {e}")
         err = str(e).lower()
-        if "429" in err or "quota" in err:
+
+        if any(k in err for k in (
+            "connection", "auth", "401", "403",
+            "client", "closed", "timeout", "reset",
+        )):
+            st.session_state.groq_client = None
+
+        if "429" in err or "quota" in err or "rate" in err:
             return "I need a breath — try again in a moment 💙\n\n📞 iCall: 9152987821"
-        return "Something went wrong 💙 Please try again."
+
+        return "Something went wrong 💙 Please try again.\n\n📞 iCall: 9152987821"
 
 
-# ── Open Mello ─────────────────────────────────────────────
 def open_mello(mood, ctx, crisis=False):
     st.session_state.messages = []
     st.session_state.page     = "crisis" if crisis else "chat"
@@ -471,9 +490,6 @@ def open_mello(mood, ctx, crisis=False):
     st.session_state.messages.append({"role": "assistant", "content": opening})
 
 
-# ══════════════════════════════════════════════════════════
-# TOPBAR
-# ══════════════════════════════════════════════════════════
 def render_topbar():
     page        = st.session_state.page
     has_results = bool(st.session_state.detected_mood and st.session_state.scores)
@@ -780,9 +796,8 @@ elif st.session_state.page == "results":
 # ══════════════════════════════════════════════════════════
 elif st.session_state.page == "nearby":
 
-    DEFAULT_LAT, DEFAULT_LNG = 28.6139, 77.2090   # New Delhi
+    DEFAULT_LAT, DEFAULT_LNG = 28.6139, 77.2090
 
-    # Guarantee a location so the map ALWAYS renders
     if st.session_state.user_lat is None:
         st.session_state.user_lat = DEFAULT_LAT
         st.session_state.user_lng = DEFAULT_LNG
@@ -790,7 +805,6 @@ elif st.session_state.page == "nearby":
     if "_nearby_loc_key" not in st.session_state:
         st.session_state._nearby_loc_key = None
 
-    # ── Hero ────────────────────────────────────────────────
     st.markdown("""
     <div style="animation:slideUp 0.5s ease-out;
                 text-align:center;padding:16px 0 8px">
@@ -804,7 +818,6 @@ elif st.session_state.page == "nearby":
 
     st.write("")
 
-    # ── AI Recommendation banner ────────────────────────────
     mood = st.session_state.detected_mood
     if mood and mood.lower() != "normal":
         mood_advice = {
@@ -890,7 +903,6 @@ elif st.session_state.page == "nearby":
 
     st.divider()
 
-    # ── Search controls (ABOVE the map so state is set first) ──
     st.markdown('<div class="section-label">🔍 Search what to find</div>',
                 unsafe_allow_html=True)
 
@@ -905,7 +917,6 @@ elif st.session_state.page == "nearby":
 
     radius_km = st.slider("Search radius", 1, 20, 5, format="%d km")
 
-    # ── Determine search type ───────────────────────────────
     search_type = None
     if btn_hosp: search_type = "hospital"
     if btn_doc:  search_type = "doctor"
@@ -915,8 +926,6 @@ elif st.session_state.page == "nearby":
     lng = st.session_state.user_lng
     loc_key = f"{lat:.4f},{lng:.4f}"
 
-    # ── AUTO-SEARCH: fire on first visit or when location changes ──
-    # This is what makes the map already populated when you open the page.
     if st.session_state._nearby_loc_key != loc_key and search_type is None:
         st.session_state._nearby_loc_key = loc_key
         st.session_state.selected_place_idx = None
@@ -931,7 +940,6 @@ elif st.session_state.page == "nearby":
                 st.session_state.nearby_places = []
                 st.session_state.nearby_error = str(e)
 
-    # ── Manual search click ─────────────────────────────────
     if search_type:
         with st.spinner(f"Searching OpenStreetMap within {radius_km} km..."):
             try:
@@ -948,11 +956,9 @@ elif st.session_state.page == "nearby":
                 st.session_state.nearby_places = []
                 st.session_state.nearby_error = str(e)
 
-    # ── Current state values ────────────────────────────────
     places  = st.session_state.nearby_places or []
     sel_idx = st.session_state.get("selected_place_idx", None)
 
-    # ── Status banner ───────────────────────────────────────
     if st.session_state.nearby_error:
         st.warning(
             "⚠️ Couldn't reach OpenStreetMap servers. "
@@ -963,15 +969,11 @@ elif st.session_state.page == "nearby":
     else:
         st.info("📍 Showing your location. Press a search button above to find help nearby.")
 
-    # ══════════════════════════════════════════════════════════
-    # MAP — always rendered, defaults to Delhi with hospitals
-    # ══════════════════════════════════════════════════════════
     st.markdown('<div class="section-label">🗺️ Map</div>',
                 unsafe_allow_html=True)
 
     try:
         map_html = build_map_html(lat, lng, places, sel_idx)
-        # Cache-buster so the iframe re-mounts when places or selection change
         map_html += f"\n<!-- v={len(places)}-{sel_idx}-{lat:.4f}-{lng:.4f} -->"
         components.html(map_html, height=440)
     except Exception as e:
@@ -979,7 +981,6 @@ elif st.session_state.page == "nearby":
 
     st.write("")
 
-    # ── Location controls (collapsed expander) ──────────────
     with st.expander("📍 Change Location", expanded=False):
         tab1, tab2 = st.tabs(["🌐 Auto-detect", "✏️ Manual input"])
 
@@ -1017,7 +1018,7 @@ elif st.session_state.page == "nearby":
                     st.session_state.nearby_places = []
                     st.session_state.selected_place_idx = None
                     st.session_state.nearby_error = None
-                    st.session_state._nearby_loc_key = None   # force auto-search
+                    st.session_state._nearby_loc_key = None
                     st.success("✅ Location set!")
                     st.rerun()
                 except Exception:
@@ -1045,7 +1046,7 @@ elif st.session_state.page == "nearby":
                     st.session_state.nearby_places = []
                     st.session_state.selected_place_idx = None
                     st.session_state.nearby_error = None
-                    st.session_state._nearby_loc_key = None   # force auto-search
+                    st.session_state._nearby_loc_key = None
                     st.success(f"✅ {display[:65]}...")
                     st.rerun()
                 else:
@@ -1072,12 +1073,11 @@ elif st.session_state.page == "nearby":
                 st.session_state.nearby_places = []
                 st.session_state.selected_place_idx = None
                 st.session_state.nearby_error = None
-                st.session_state._nearby_loc_key = None   # force auto-search
+                st.session_state._nearby_loc_key = None
                 st.rerun()
 
             st.caption("Find your coordinates: maps.google.com → right click → copy.")
 
-    # ── Current location pill ───────────────────────────────
     st.markdown(f"""
     <div style="background:rgba(124,58,237,0.08);
                 border:1px solid rgba(124,58,237,0.2);
@@ -1093,7 +1093,6 @@ elif st.session_state.page == "nearby":
 
     st.write("")
 
-    # ── Result cards ────────────────────────────────────────
     if places:
         st.markdown(
             '<div class="section-label">Tap a card to zoom the map to it</div>',
@@ -1135,7 +1134,6 @@ elif st.session_state.page == "nearby":
                         st.session_state.selected_place_idx = idx
                         st.rerun()
 
-        # Directions for the selected hospital
         if sel_idx is not None and sel_idx < len(places):
             sel = places[sel_idx]
             st.write("")
@@ -1183,7 +1181,7 @@ elif st.session_state.page == "nearby":
 
 
 # ══════════════════════════════════════════════════════════
-# PAGE: ANALYZE   ← THIS BLOCK WAS MISSING
+# PAGE: ANALYZE
 # ══════════════════════════════════════════════════════════
 else:
 
@@ -1248,7 +1246,6 @@ else:
         render_face_scan_tab()
     st.write("")
 
-    # Stats row
     if st.session_state.total_scans > 0:
         st.divider()
         st.markdown('<div class="section-label">Session</div>', unsafe_allow_html=True)
